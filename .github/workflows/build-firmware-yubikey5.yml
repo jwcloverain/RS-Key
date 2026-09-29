@@ -1,0 +1,58 @@
+name: build-firmware-yubikey5
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      VIDPID: Yubikey5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v3
+
+      - name: Cache Nix
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: Build firmware with Yubikey5 VID/PID
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+
+          # This repo's firmware builder reads VIDPID from the environment.
+          # Using --impure allows Nix to see the env var.
+          nix build --impure .#firmware --no-link --print-out-paths > /tmp/firmware-path.txt
+          out="$(cat /tmp/firmware-path.txt)"
+
+          echo "Firmware output path: $out"
+
+          # Copy the generated firmware files into dist/
+          cp "$out/firmware.uf2" dist/rs-key-yubikey5.uf2
+          cp "$out/firmware.elf" dist/rs-key-yubikey5.elf
+
+          ls -l dist
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rs-key-firmware-yubikey5
+          path: |
+            dist/*.uf2
+            dist/*.elf
+          if-no-files-found: error
+          retention-days: 30
