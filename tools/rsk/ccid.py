@@ -14,6 +14,8 @@ VENDOR_AID = [0xF0, 0x00, 0x00, 0x00, 0x01]
 # ISO 7816-4 status words, as the (sw1, sw2) tuple transmit() returns.
 SW_OK = (0x90, 0x00)
 SW_COND_NOT_SATISFIED = (0x69, 0x85)
+# A write the configuration lock refuses without its code (a YubiKey's answer too).
+SW_COMMAND_NOT_ALLOWED = (0x69, 0x86)
 
 
 def _require():
@@ -21,10 +23,10 @@ def _require():
         sys.exit("missing dependency: pyscard (run `rsk` from `nix develop`)")
 
 
-# Reader-name tokens that mark our device: the default build's product string
-# carries "RS-Key"; the opt-in Yubico interop flavor carries "RSK". Neither
-# appears in a genuine YubiKey's reader name, so we never grab the wrong device.
-RSK_READER_TOKENS = ("RS-Key", "RSK")
+# Linux pcscd uses the driver's friendly name, not the USB product string.
+# Its appended USB serial (firmware/src/main.rs) identifies the interop build
+# even when the driver's name drops the product's RS-Key/RSK marker.
+RSK_READER_TOKENS = ("RS-Key", "RSK", "(rs-key-0001)")
 
 
 def _is_rsk(name):
@@ -45,7 +47,7 @@ def find_reader(substr=None, exclusive=False):
     if not hits:
         sys.exit(
             "no RS-Key PC/SC reader found — check the device is plugged in, CCID is "
-            f"enabled, and the product string still matches. Readers seen: {[str(r) for r in rs]}"
+            f"enabled, and the reader name still matches. Readers seen: {[str(r) for r in rs]}"
         )
     # …and no first-match guess either, for the irreversible commands: the name is a
     # substring test over a host-settable USB string, so a second key left in app

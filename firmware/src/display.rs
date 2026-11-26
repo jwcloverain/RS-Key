@@ -26,7 +26,7 @@ use rsk_display::{BL_TOP, TouchPad};
 use rsk_rsa::RsaKey;
 
 use crate::flash_storage::FlashStorage;
-use crate::handler::{FidoRng, Store};
+use crate::handler::FidoRng;
 
 #[path = "display_panel.rs"]
 mod display_panel;
@@ -35,14 +35,29 @@ pub(crate) use display_panel::PioDisplayTx;
 
 pub use rsk_display::{DeviceInfo, DeviceKeys, UI_YIELD_FLOOR_MS, piv_ref_title};
 
-/// CST328 7-bit I2C address.
+/// CST328 7-bit I2C address — the touch controller on the V1 revision of the
+/// Waveshare board.
+#[cfg(not(display_tp = "cst3530"))]
 const CST328_ADDR: u16 = 0x1A;
 
+/// CST3530 7-bit I2C address — the touch controller Waveshare swapped in on the
+/// V2 revision. Select it with `DISPLAY_TP_CHIP=cst3530`.
+#[cfg(display_tp = "cst3530")]
+const CST3530_ADDR: u16 = 0x58;
+/// Report block: nine bytes, the first point at `[4..8]`.
+#[cfg(display_tp = "cst3530")]
+const CST3530_DATA_REG: u32 = 0xD007_0000;
+/// Writing this bare register address acks the report, letting the controller
+/// latch the next one.
+#[cfg(display_tp = "cst3530")]
+const CST3530_END_READ_REG: u32 = 0xD000_02AB;
+
 /// This board's instance of the flow.
-pub type Ui = rsk_display::Ui<'static, Panel, Touch, DisplayHooks, FlashStorage, FidoRng>;
+pub type Ui = rsk_display::Ui<'static, Panel, Touch, DisplayHooks>;
 /// The on-screen presence backend over this board's panel.
-pub type TouchPresence =
-    rsk_display::TouchPresence<'static, Panel, Touch, DisplayHooks, FlashStorage, FidoRng>;
+pub type TouchPresence = rsk_display::TouchPresence<'static, Panel, Touch, DisplayHooks>;
+/// The cells this board's own screens borrow, handed to `build` and `status_task` only.
+pub type Parked = rsk_display::Parked<'static, FlashStorage, FidoRng>;
 
 /// The panel's SPI bus + control pins, bundled so `main` stays
 /// within embassy's argument cap when it hands the peripherals over.
@@ -82,17 +97,17 @@ pub struct Touch {
 impl Touch {
     /// Leave normal reporting mode set after the reset pulse — write register
     /// 0xD109 (REG_MODE_NORMAL) as a 2-byte big-endian address with no payload.
+    /// CST328 only: it comes out of reset in monitor mode. The CST3530 reports in
+    /// normal mode straight out of reset, and 0xD109 is not one of its register
+    /// addresses (its map is four-byte addresses starting at 0xD00000xx).
+    #[cfg(not(display_tp = "cst3530"))]
     fn normal_mode(&mut self) {
         let _ = self.i2c.blocking_write(CST328_ADDR, &[0xD1, 0x09]);
     }
-}
 
-impl TouchPad for Touch {
-    /// Read the first finger's coordinate, if any, then clear the report so the
-    /// controller serves the next one. Any I2C error reads as "no touch". The
-    /// coordinate is already in panel pixels (the controller is configured at the
-    /// panel resolution; HW bringup confirmed the axes need no swap).
-    fn read(&mut self) -> Option<rsk_ui::Point> {
+    /// CST328 read: 7-byte report at register `0xD000`, cleared by writing `0xD005`.
+    #[cfg(not(display_tp = "cst3530"))]
+    fn read_report(&mut self) -> Option<rsk_ui::Point> {
         let mut buf = [0u8; 7];
         let pt = match self
             .i2c
@@ -104,6 +119,38 @@ impl TouchPad for Touch {
         // Clear register 0xD005 (write address + a 0 byte) to ack the report.
         let _ = self.i2c.blocking_write(CST328_ADDR, &[0xD0, 0x05, 0x00]);
         pt
+    }
+
+    /// CST3530 read: nine-byte report at `0xD0070000`, acked by writing the bare
+    /// `0xD00002AB` address. Any I2C error still acks, so a half-read frame can not
+    /// wedge the controller's next report.
+    #[cfg(display_tp = "cst3530")]
+    fn read_report(&mut self) -> Option<rsk_ui::Point> {
+        let mut buf = [0u8; 9];
+        let pt = match self.i2c.blocking_write_read(
+            CST3530_ADDR,
+            &CST3530_DATA_REG.to_be_bytes(),
+            &mut buf,
+        ) {
+            Ok(()) => rsk_ui::touch::parse_cst3530(&buf),
+            Err(_) => None,
+        };
+        let _ = self
+            .i2c
+            .blocking_write(CST3530_ADDR, &CST3530_END_READ_REG.to_be_bytes());
+        pt
+    }
+}
+
+impl TouchPad for Touch {
+    /// Read the first finger's coordinate, if any, then clear the report so the
+    /// controller serves the next one. Any I2C error reads as "no touch". The
+    /// coordinate is already in panel pixels (both controllers are read in the
+    /// panel's own axes; the CST3530 path needs no swap either, confirmed against
+    /// Waveshare's V2 BSP, which only remaps for non-zero rotations and the panel
+    /// here is rotation 0).
+    fn read(&mut self) -> Option<rsk_ui::Point> {
+        self.read_report()
     }
 }
 
@@ -125,6 +172,10 @@ pub struct DisplayHooks {
 impl rsk_display::Hooks for DisplayHooks {
     fn set_backlight(&mut self, duty: u16) {
         self.bl.set_config(&backlight_cfg(duty));
+    }
+
+    fn sweep_dead_stack(&mut self) {
+        crate::sweep::dead_stack();
     }
 
     fn wake_pressed(&self) -> bool {
@@ -173,9 +224,9 @@ impl rsk_display::Hooks for DisplayHooks {
     }
 
     /// The same worker signal, because its whole effect is what both events need:
-    /// end the RAM `pinUvAuthToken` before the next CBOR command. They stay mapped
-    /// together only while that holds — a re-key-*specific* side effect added
-    /// there would then fire on a failed check too.
+    /// end the RAM `pinUvAuthToken` before either transport's next FIDO command. They
+    /// stay mapped together only while that holds — a re-key-*specific* side effect
+    /// added there would then fire on a failed check too.
     fn note_local_pin_failed(&mut self) {
         crate::handler::note_local_pin_changed();
     }
@@ -228,8 +279,7 @@ pub fn build(
     panel: PanelHw,
     touch: TouchHw,
     info: DeviceInfo,
-    fs: &'static RefCell<Store>,
-    keys: DeviceKeys,
+    cells: Parked,
     rng: &'static RefCell<FidoRng>,
     wake_btn: Option<(Input<'static>, bool)>,
 ) -> Ui {
@@ -263,28 +313,35 @@ pub fn build(
     ];
     let panel = Panel::new(spi, cs, dc, rst, damage_key, invert, color_order);
 
-    // CST328 reset pulse (high → low → high), then normal reporting mode.
+    // CST328 reset pulse (high → low → high), then normal reporting mode. The
+    // CST3530 wants the same pulse (10 ms low, 50 ms high by its BSP) and needs no
+    // mode write, so the only difference here is the second half.
     tp_rst.set_high();
     block_for(Duration::from_millis(10));
     tp_rst.set_low();
     block_for(Duration::from_millis(10));
     tp_rst.set_high();
     block_for(Duration::from_millis(50));
-    let mut touch = Touch { i2c };
-    touch.normal_mode();
+    let touch = Touch { i2c };
+    #[cfg(not(display_tp = "cst3530"))]
+    let touch = {
+        let mut touch = touch;
+        touch.normal_mode();
+        touch
+    };
 
     let hooks = DisplayHooks {
         bl,
         tp_rst,
         wake_btn,
     };
-    Ui::new(panel, touch, hooks, info, fs, keys, rng)
+    Ui::new(panel, touch, hooks, info, cells)
 }
 
 /// The ambient status screen. `#[embassy_executor::task]` cannot be generic, so
 /// this monomorphic wrapper is what the spawner takes; the loop itself is
 /// [`rsk_display::status_loop`].
 #[embassy_executor::task]
-pub async fn status_task(ui: &'static RefCell<Ui>) {
-    rsk_display::status_loop(ui).await;
+pub async fn status_task(ui: &'static RefCell<Ui>, cells: Parked) {
+    rsk_display::status_loop(ui, cells).await;
 }
